@@ -2,6 +2,7 @@
 
 Spreadsheet and apps script to create a portfolio tracker and cgt calculator (First-In-First-Out) in Google Sheets.
 Relies on data exported from Self Wealth's 'Movements' Reports.
+Only set up for use with ASX listed companies.
 
 Steps:
 - Upload XLSX to Google Sheets, open, and "Save to Google Sheets".
