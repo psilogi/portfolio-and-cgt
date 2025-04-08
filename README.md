@@ -23,7 +23,7 @@ Updating/Adding additional financial years:
 
 NOTES:
 - Calculation and portfolio is only as good as the Trade data you enter.
-- Any other platforms with different columns for exportswill need additional massaging
+- Any other platforms with different columns for exports will need additional massaging
 - If SW updates their export format, the calculations will not function correctly.
 - Delisted stocks can be listed at C10 (e.g, 'ABC,XYZ,QRS')
   - I had to do this for a stock that was delisted. I can no longer sell the shares so they are counted as a loss
