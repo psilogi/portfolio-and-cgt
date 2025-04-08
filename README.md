@@ -17,7 +17,8 @@ Updating/Adding additional financial years:
 - select cell B1 in "CGT Calculator"
 - select Date > Data validation
 - select rule labelled B1
-- "Add another item" using the format YYYY-YYYY, e.g., 2004-2005, for the financial year of interest, e.g., 1/07/2004 - 30/06/2005.
+- "Add another item" using the format YYYY-YYYY for the financial year of interest
+  - e.g., 2004-2005 for 1/07/2004 - 30/06/2005.
 
 NOTES:
 - Calculation and portfolio is only as good as the Trade data you enter.
