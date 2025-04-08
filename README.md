@@ -9,7 +9,7 @@ Steps:
 - Open Extensions > Apps Script and paste in the provided code.
 - Rename, save, and reload spreadsheet to give permissions.
 - Export all trades at Self Wealth > Trading Account > Reports > Movements > Time Period > Custom.
-- Copy all Trades into A1 on "Trades" sheet.
+- Copy all Trade data into "Trades" sheet.
 - Access either "Portfolio Summary" or "CGT Calculator" sheet (Choose financial year in "CGT Calculator", cell B1)
 - Run "CGT Tools" from Spreadsheet menu bar to, either, Update your portfolio summary or calculate cgt.
 - Add graphs or other visualisations - e.g., pie chart with Column A and Column I to visualise current market holdings by stock ticker.
