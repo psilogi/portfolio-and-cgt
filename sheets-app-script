@@ -10,11 +10,13 @@ const CGT_SHEET_NAME = "CGT Calculator";
 const PORTFOLIO_SUMMARY_SHEET_NAME = "Portfolio Summary";
 
 // --- CGT Calculator Sheet Constants ---
-const FY_CELL = "B1"; // Cell containing the Financial Year dropdown (e.g., "2024-2025")
-const FY_START_CELL = "B2"; // Cell with the calculated FY Start Date
-const FY_END_CELL = "B3"; // Cell with the calculated FY End Date
-const CGT_OUTPUT_START_ROW = 8; // Row where the CGT results start
-const CGT_OUTPUT_START_COL = 1; // Column where results start (1 = A)
+const FY_CELL = "C1"; // Cell containing the Financial Year dropdown (e.g., "2024-2025")
+const FY_START_CELL = "C2"; // Cell with the calculated FY Start Date
+const FY_END_CELL = "C3"; // Cell with the calculated FY End Date
+const PREV_YEARS_LOSS_CELL = "C14"; // Cell for manually entering prior year carry-forward loss
+const CGT_OUTPUT_START_ROW = 18; // Row where the CGT results start
+const CGT_OUTPUT_START_COL = 1; // Column where current FY results start (1 = A)
+const CGT_NUM_OUTPUT_COLS = 12; // Number of columns for CGT output (A-L)
 
 // --- Portfolio Summary Sheet Constants ---
 const PS_DETAIL_START_ROW = 13; // Row where the detailed stock breakdown starts
@@ -57,6 +59,7 @@ function onEdit(e) {
   const cellAddress = range.getA1Notation();
 
   // --- Configuration Check ---
+  // Run if the FY dropdown in B1 is edited
   if (sheetName === CGT_SHEET_NAME &&
       cellAddress === FY_CELL &&
       range.getNumRows() === 1 &&
@@ -68,6 +71,7 @@ function onEdit(e) {
         Logger.log(`calculateCGT finished successfully after edit in ${FY_CELL}.`);
     } catch (error) {
         Logger.log(`Error running calculateCGT automatically from onEdit trigger: ${error} \n${error.stack}`);
+        SpreadsheetApp.getUi().alert(`Error running CGT calculation automatically: ${error}. Check Logs.`);
     }
   }
 }
@@ -80,7 +84,7 @@ function onEdit(e) {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('CGT Tools')
-    .addItem('Calculate CGT for Selected Year', 'calculateCGT')
+    .addItem('Calculate CGT for Selected Year', 'calculateCGT') // Changed menu item text
     .addSeparator()
     .addItem('Update Accurate Portfolio Summary', 'updatePortfolioSummary')
     .addToUi();
@@ -95,62 +99,138 @@ function calculateCGT() {
   const cgtSheet = ss.getSheetByName(CGT_SHEET_NAME);
   const ui = SpreadsheetApp.getUi();
 
-  // --- 1. Verification & 2. Get FY Info ---
+  // --- 1. Verification ---
   if (!tradesSheet) { ui.alert(`Error: Sheet "${TRADES_SHEET_NAME}" not found.`); return; }
   if (!cgtSheet) { ui.alert(`Error: Sheet "${CGT_SHEET_NAME}" not found.`); return; }
-  const fyStr = cgtSheet.getRange(FY_CELL).getValue();
-  const fyStartDate = cgtSheet.getRange(FY_START_CELL).getValue();
-  const fyEndDate = cgtSheet.getRange(FY_END_CELL).getValue();
-  if (!fyStr || !(fyStartDate instanceof Date) || !(fyEndDate instanceof Date)) {
-    ui.alert('Error: Invalid Financial Year/Dates in CGT sheet B1:B3.'); return;
+
+  // --- 2. Get FY Info for the SELECTED Year ---
+  const currentFyStr = cgtSheet.getRange(FY_CELL).getValue();
+  const currentFyStartDate = cgtSheet.getRange(FY_START_CELL).getValue();
+  const currentFyEndDate = cgtSheet.getRange(FY_END_CELL).getValue();
+
+  if (!currentFyStr || !(currentFyStartDate instanceof Date) || !(currentFyEndDate instanceof Date)) {
+    ui.alert('Error: Invalid Financial Year/Dates in CGT sheet B1:B3. Please select a valid FY.'); return;
   }
-  const fyEndDateCorrected = new Date(fyEndDate); // Avoid modifying original date object
-  fyEndDateCorrected.setHours(23, 59, 59, 999);
-  Logger.log(`==== STARTING CGT Calculation for FY: ${fyStr} (${fyStartDate.toLocaleDateString()} - ${fyEndDateCorrected.toLocaleDateString()}) ====`);
+
+  // Correct end date to include the whole day
+  const currentFyEndDateCorrected = new Date(currentFyEndDate);
+  currentFyEndDateCorrected.setHours(23, 59, 59, 999);
+
+  Logger.log(`==== STARTING CGT Calculation for FY: ${currentFyStr} (${currentFyStartDate.toLocaleDateString()} - ${currentFyEndDateCorrected.toLocaleDateString()}) ====`);
 
   // --- 3. Read and Sort Trade Data ---
   const tradesDataRange = tradesSheet.getDataRange();
-  let tradesValues = tradesDataRange.getValues().slice(1);
-  tradesValues = tradesValues.filter(row => row.some(cell => String(cell).trim() !== ""));
-  if (tradesValues.length === 0) { ui.alert(`Error: No valid trade data found in "${TRADES_SHEET_NAME}".`); return; }
+  let tradesValues = tradesDataRange.getValues().slice(1); // Get all data except header
+  tradesValues = tradesValues.filter(row => row.some(cell => String(cell).trim() !== "")); // Filter truly empty rows
+  if (tradesValues.length === 0) { ui.alert(`Error: No trade data found in "${TRADES_SHEET_NAME}" after filtering empty rows.`); return; }
 
-  tradesValues.sort((a, b) => { // Sort by Trade Date for CGT
-    const dateA = a[COL_IDX_TRADE_DATE]; const dateB = b[COL_IDX_TRADE_DATE];
-    if (!(dateA instanceof Date) && !(dateB instanceof Date)) return 0;
-    if (!(dateA instanceof Date)) return 1; if (!(dateB instanceof Date)) return -1;
-    return dateA.getTime() - dateB.getTime();
+  // Sort by Trade Date (ASC), then by Action (Buy/In first) for same-day trades
+  tradesValues.sort((a, b) => {
+      const dateA = a[COL_IDX_TRADE_DATE];
+      const dateB = b[COL_IDX_TRADE_DATE];
+      const actionA = String(a[COL_IDX_ACTION]).trim().toLowerCase();
+      const actionB = String(b[COL_IDX_ACTION]).trim().toLowerCase();
+
+      const dateAIsValid = dateA instanceof Date;
+      const dateBIsValid = dateB instanceof Date;
+
+      if (dateAIsValid && dateBIsValid) {
+          const timeDiff = dateA.getTime() - dateB.getTime();
+          if (timeDiff === 0) {
+              const priorityA = (actionA === 'buy' || actionA === 'in') ? 1 : 2;
+              const priorityB = (actionB === 'buy' || actionB === 'in') ? 1 : 2;
+              return priorityA - priorityB;
+          } else { return timeDiff; }
+      } else if (dateAIsValid && !dateBIsValid) { return -1; }
+      else if (!dateAIsValid && dateBIsValid) { return 1; }
+      else { return 0; }
   });
-  Logger.log(`Read and sorted ${tradesValues.length} trade rows for CGT calculation.`);
+  Logger.log(`Read and sorted ${tradesValues.length} trade rows by Trade Date (Buy/In prioritized on same day).`);
 
-  // --- 4. FIFO Calculation Logic ---
-  const buyInventory = {};
+  // --- 4. Perform FIFO Calculation for the SELECTED Financial Year ---
+  Logger.log(`\n--- Calculating CGT events for Selected FY: ${currentFyStr} ---`);
+  const cgtEvents = performFifoCalculation(tradesValues, currentFyStartDate, currentFyEndDateCorrected);
+
+  // --- 5. Write Results to CGT Sheet (Columns A-L) ---
+  Logger.log(`\n--- Writing Results to Sheet ${CGT_SHEET_NAME} ---`);
+  const lastRow = cgtSheet.getMaxRows(); // Use getMaxRows for clearing potential old data further down
+
+  // Clear existing data for Current FY (Columns A-L)
+  const clearStartRow = CGT_OUTPUT_START_ROW;
+  if (lastRow >= clearStartRow) {
+     const numRowsToClear = lastRow - clearStartRow + 1;
+     // Also clear columns N-Y in case old data exists there from previous script version
+     const numColsToClearIncludingOldPrev = (CGT_PREV_FY_OUTPUT_START_COL || CGT_OUTPUT_START_COL + CGT_NUM_OUTPUT_COLS + 1) - CGT_OUTPUT_START_COL + CGT_NUM_OUTPUT_COLS; // Calculate width to clear potential old data
+     cgtSheet.getRange(clearStartRow, CGT_OUTPUT_START_COL, numRowsToClear, Math.max(CGT_NUM_OUTPUT_COLS, numColsToClearIncludingOldPrev)).clearContent().clearFormat(); // Clear content and format widely
+     Logger.log(`Cleared previous data & format from row ${clearStartRow} Col ${CGT_OUTPUT_START_COL} onwards.`);
+  }
+
+  // Write Current FY results
+  if (cgtEvents.length > 0) {
+    cgtSheet.getRange(CGT_OUTPUT_START_ROW, CGT_OUTPUT_START_COL, cgtEvents.length, cgtEvents[0].length).setValues(cgtEvents);
+    // Apply formatting (optional)
+    // Example: cgtSheet.getRange(CGT_OUTPUT_START_ROW, CGT_OUTPUT_START_COL + 3, cgtEvents.length, 1).setNumberFormat('#,##0.00'); // Units
+    Logger.log(`Successfully wrote ${cgtEvents.length} CGT event rows for Selected FY (${currentFyStr}) to columns A-L.`);
+  } else {
+    Logger.log(`No 'Sell' events generated for the Selected FY (${currentFyStr}).`);
+    cgtSheet.getRange(CGT_OUTPUT_START_ROW, CGT_OUTPUT_START_COL, 1, CGT_NUM_OUTPUT_COLS).clearContent().clearFormat(); // Clear A-L just in case
+    cgtSheet.getRange(CGT_OUTPUT_START_ROW, CGT_OUTPUT_START_COL).setValue(`No 'Sell' events found in Selected FY (${currentFyStr})`);
+  }
+
+  // --- 6. Final Alert ---
+  ui.alert(`CGT Calculation Complete for FY ${currentFyStr}.\n\n${cgtEvents.length} CGT rows written.\n\nRemember to enter any prior year carry-forward loss in cell ${PREV_YEARS_LOSS_CELL} and use appropriate formulas to calculate the final Net Capital Gain for tax purposes.`);
+  Logger.log(`==== END CGT Calculation ====`);
+}
+
+
+/**
+ * Performs the core FIFO logic and generates CGT events for a specific financial year.
+ * @param {Array<Array>} sortedTradesValues Sorted array of ALL trade data rows (Buy/In prioritized on same day).
+ * @param {Date} targetFyStartDate The start date of the financial year to calculate for.
+ * @param {Date} targetFyEndDateCorrected The end date (inclusive, time adjusted) of the financial year.
+ * @returns {Array<Array>} An array of CGT event rows for the specified financial year.
+ */
+function performFifoCalculation(sortedTradesValues, targetFyStartDate, targetFyEndDateCorrected) {
+  const buyInventory = {}; // Reset inventory for the calculation run
   const cgtEvents = [];
+  let skippedRowCount = 0; // Counter for skipped rows
 
-  for (const [i, trade] of tradesValues.entries()) {
-    const sheetRowNumber = i + 2;
-    const tradeDate = trade[COL_IDX_TRADE_DATE];
+  for (const [i, trade] of sortedTradesValues.entries()) {
+    const originalSheetRowNumber = i + 2; // Estimate original sheet row
+    const tradeDateRaw = trade[COL_IDX_TRADE_DATE];
     const action = String(trade[COL_IDX_ACTION]).trim().toLowerCase();
-    const stockCode = String(trade[COL_IDX_CODE]).trim().toUpperCase(); // Use uppercase for consistency
+    const stockCode = String(trade[COL_IDX_CODE]).trim().toUpperCase();
     const stockName = trade[COL_IDX_NAME];
     const unitsRaw = trade[COL_IDX_UNITS];
     const totalRaw = trade[COL_IDX_TOTAL];
 
-    // --- Parse and Validate ---
+    // --- VALIDATE TRADE DATE ---
+    if (!(tradeDateRaw instanceof Date)) {
+        Logger.log(`SKIP Row ~${originalSheetRowNumber}: Invalid or Missing Trade Date (Col A). Value: "${tradeDateRaw}". Cannot process for FIFO/FY assignment.`);
+        skippedRowCount++;
+        continue; // Skip this entire trade row
+    }
+    const tradeDate = tradeDateRaw; // It's a valid Date object
+
+    // --- Parse and Validate Other Fields ---
     const units = parseFloat(String(unitsRaw).replace(/,/g, ''));
     let total;
     if (typeof totalRaw === 'number') { total = totalRaw; }
-    else if (typeof totalRaw === 'string' && totalRaw.trim() !== '') {
-        total = parseFloat(totalRaw.replace(/[$,]/g, ''));
-    } else { total = NaN; }
+    else if (typeof totalRaw === 'string' && totalRaw.trim() !== '') { total = parseFloat(totalRaw.replace(/[$,]/g, '')); }
+    else { total = NaN; }
 
-    if (!(tradeDate instanceof Date)) {
-      Logger.log(`CGT Calc Skip Row ${sheetRowNumber}: Invalid Trade Date. (${tradeDate})`); continue; }
-     if (!action || !stockCode) {
-      Logger.log(`CGT Calc Skip Row ${sheetRowNumber}: Missing Action or Stock Code.`); continue; }
+    if (!action || !stockCode) {
+      Logger.log(`SKIP Row ~${originalSheetRowNumber} (Date: ${tradeDate.toLocaleDateString()}): Missing Action or Stock Code.`);
+      skippedRowCount++; continue;
+     }
      if (isNaN(units) || units <= 0) {
-       Logger.log(`CGT Calc Skip Row ${sheetRowNumber}: Invalid Units for ${action}.`); continue; }
+       Logger.log(`SKIP Row ~${originalSheetRowNumber} (Date: ${tradeDate.toLocaleDateString()}, Code: ${stockCode}, Action: ${action}): Invalid or Zero Units. Value: "${unitsRaw}"`);
+       skippedRowCount++; continue;
+     }
     if ((action === 'buy' || action === 'sell') && isNaN(total)) {
-      Logger.log(`CGT Calc Skip Row ${sheetRowNumber}: Invalid Total for ${action}.`); continue; }
+      Logger.log(`SKIP Row ~${originalSheetRowNumber} (Date: ${tradeDate.toLocaleDateString()}, Code: ${stockCode}, Action: ${action}): Invalid or Missing Total. Value: "${totalRaw}"`);
+      skippedRowCount++; continue;
+    }
 
     // --- Process Actions ---
     if (!buyInventory[stockCode]) buyInventory[stockCode] = [];
@@ -158,10 +238,10 @@ function calculateCGT() {
     if (action === "buy" || (action === "in" && !isNaN(total) && total !== 0)) { // Buy or 'In with cost'
         const costPerUnit = (units !== 0) ? total / units : 0;
         buyInventory[stockCode].push({ tradeDate: tradeDate, unitsAvailable: units, costPerUnit: costPerUnit, originalTotalCost: total });
-        // Logger.log(`CGT Added Inv (${action}): ${tradeDate.toLocaleDateString()} ${stockCode} ${units} @ ${costPerUnit.toFixed(4)}`);
+        // Logger.log(`Added Inv (${action}): ${tradeDate.toLocaleDateString()} ${stockCode} ${units} @ ${costPerUnit.toFixed(4)}`);
     } else if (action === "in") { // 'In' with zero or no cost
         buyInventory[stockCode].push({ tradeDate: tradeDate, unitsAvailable: units, costPerUnit: 0, originalTotalCost: 0 });
-        // Logger.log(`CGT Added Inv (in-zero cost): ${tradeDate.toLocaleDateString()} ${stockCode} ${units} @ 0.0000`);
+        // Logger.log(`Added Inv (in-zero cost): ${tradeDate.toLocaleDateString()} ${stockCode} ${units} @ 0.0000`);
     } else if (action === "sell" || action === "out") { // Sell or Out
         let unitsToAccountFor = units;
         let costBaseCalculated = 0;
@@ -169,30 +249,39 @@ function calculateCGT() {
         let errorMsg = null;
         let ltUnitsSold = 0, ltCostBase = 0, ltProceeds = 0, ltEarliestAcqDate = null;
         let stUnitsSold = 0, stCostBase = 0, stProceeds = 0, stEarliestAcqDate = null;
-        let isSaleInTargetFY = (action === "sell" && tradeDate >= fyStartDate && tradeDate <= fyEndDateCorrected);
 
-        // if (action === "sell") Logger.log(`\n--- CGT Processing Sale: ...`);
-        // else Logger.log(`--- CGT Processing Out: ...`);
+        // Check if this specific sale falls within the TARGET financial year
+        let isSaleInTargetFY = (action === "sell" && tradeDate >= targetFyStartDate && tradeDate <= targetFyEndDateCorrected);
 
         const currentAvailable = buyInventory[stockCode].reduce((sum, p) => sum + p.unitsAvailable, 0);
         if (currentAvailable < unitsToAccountFor - 0.0001) {
-            errorMsg = `Not enough units. Need ${unitsToAccountFor.toFixed(4)}, Have ${currentAvailable.toFixed(4)}.`;
-            Logger.log(`CGT FIFO Error Row ${sheetRowNumber} (${stockCode}, ${action}): ${errorMsg}`);
-            if (isSaleInTargetFY) { cgtEvents.push([stockCode, stockName, tradeDate, units, disposalProceeds, "ERROR: "+errorMsg, null, "N/A", "N/A", "ERROR: "+errorMsg, 0, "ERROR: "+errorMsg]); }
-            continue;
+            errorMsg = `Not enough units in inventory at time of ${action}. Need ${unitsToAccountFor.toFixed(4)}, Have ${currentAvailable.toFixed(4)}. Check prior trades.`;
+            Logger.log(`FIFO Error Row ~${originalSheetRowNumber} (${stockCode}, ${action} on ${tradeDate.toLocaleDateString()}): ${errorMsg}`);
+            if (isSaleInTargetFY) {
+                 cgtEvents.push([stockCode, stockName, tradeDate, units, disposalProceeds, "ERROR: "+errorMsg, null, "N/A", "N/A", "ERROR: "+errorMsg, 0, "ERROR: "+errorMsg]);
+            }
+            // Do not 'continue'; proceed to consume available inventory
         }
 
-        // FIFO Parcel Loop
-        for (let i = 0; i < buyInventory[stockCode].length; i++) {
-            const buyParcel = buyInventory[stockCode][i];
+        // FIFO Parcel Loop - Consume available inventory parcels
+        let unitsSuccessfullySourced = 0;
+        for (let parcelIndex = 0; parcelIndex < buyInventory[stockCode].length; parcelIndex++) {
+            const buyParcel = buyInventory[stockCode][parcelIndex];
             if (buyParcel.unitsAvailable <= 0.0001) continue;
-            const unitsFromThisParcel = Math.min(unitsToAccountFor, buyParcel.unitsAvailable);
+
+            const unitsFromThisParcel = Math.min(unitsToAccountFor - unitsSuccessfullySourced, buyParcel.unitsAvailable);
+
             if (unitsFromThisParcel > 0) {
                 const costFromThisParcel = unitsFromThisParcel * buyParcel.costPerUnit;
                 costBaseCalculated += costFromThisParcel;
-                if (action === "sell") { // Only track proceeds/LT/ST for actual sales
+                unitsSuccessfullySourced += unitsFromThisParcel;
+
+                if (action === "sell") {
                     const proceedsFromThisParcel = (units > 0) ? (unitsFromThisParcel / units) * disposalProceeds : 0;
-                    let isLongTerm = (new Date(buyParcel.tradeDate.getFullYear() + 1, buyParcel.tradeDate.getMonth(), buyParcel.tradeDate.getDate()) <= tradeDate);
+                    const acquisitionDatePlusOneYear = new Date(buyParcel.tradeDate);
+                    acquisitionDatePlusOneYear.setFullYear(acquisitionDatePlusOneYear.getFullYear() + 1);
+                    let isLongTerm = (acquisitionDatePlusOneYear <= tradeDate);
+
                     if (isLongTerm) {
                         ltUnitsSold += unitsFromThisParcel; ltCostBase += costFromThisParcel; ltProceeds += proceedsFromThisParcel;
                         if (ltEarliestAcqDate === null || buyParcel.tradeDate.getTime() < ltEarliestAcqDate.getTime()) { ltEarliestAcqDate = buyParcel.tradeDate; }
@@ -202,59 +291,50 @@ function calculateCGT() {
                     }
                 }
                 buyParcel.unitsAvailable -= unitsFromThisParcel;
-                unitsToAccountFor -= unitsFromThisParcel;
-                // Logger.log(` -> Used ${unitsFromThisParcel.toFixed(4)} from ${buyParcel.tradeDate.toLocaleDateString()}...`);
             }
-            if (unitsToAccountFor <= 0.0001) { unitsToAccountFor = 0; break; }
-        } // End FIFO
+            if (unitsSuccessfullySourced >= unitsToAccountFor - 0.0001) break;
+        } // End FIFO Parcel Loop
 
-        // Generate Output Rows ONLY FOR SELLS in FY
-        if (unitsToAccountFor > 0.0001) {
-             Logger.log(`CGT FIFO Error Row ${sheetRowNumber} (${stockCode}, ${action}): Loop finished short.`);
-             if (isSaleInTargetFY) { errorMsg = `ERROR: Sold ${units.toFixed(4)}, only ${units - unitsToAccountFor.toFixed(4)} sourced (Internal Loop Error).`; cgtEvents.push([stockCode, stockName, tradeDate, units, disposalProceeds, errorMsg, null, "N/A", "N/A", errorMsg, 0, errorMsg]); }
-        } else if (isSaleInTargetFY) { // Successfully sourced AND sale is in target FY
-            if (ltUnitsSold > 0.0001) { /* push LT event */
-                let ltGrossGainLoss = ltProceeds - ltCostBase; let ltDiscount = (ltGrossGainLoss > 0) ? ltGrossGainLoss * 0.5 : 0; let ltNetGainLoss = ltGrossGainLoss - ltDiscount;
-                let ltHoldingPeriod = ltEarliestAcqDate ? Math.floor((tradeDate.getTime() - ltEarliestAcqDate.getTime()) / (1000 * 60 * 60 * 24)) : "N/A";
-                cgtEvents.push([ stockCode, stockName + " (LT)", tradeDate, ltUnitsSold, ltProceeds, ltCostBase, ltEarliestAcqDate, ltHoldingPeriod, "Yes", ltGrossGainLoss, ltDiscount, ltNetGainLoss ]);
+        // Generate Output Rows ONLY FOR SELLS IN THE TARGET FY
+        if (unitsSuccessfullySourced < unitsToAccountFor - 0.0001 && !errorMsg) {
+             const shortfall = unitsToAccountFor - unitsSuccessfullySourced;
+             errorMsg = `Internal FIFO loop error or inventory discrepancy. Required ${unitsToAccountFor.toFixed(4)}, sourced ${unitsSuccessfullySourced.toFixed(4)} (shortfall ${shortfall.toFixed(4)}).`;
+             Logger.log(`FIFO Error Row ~${originalSheetRowNumber} (${stockCode}, ${action} on ${tradeDate.toLocaleDateString()}): ${errorMsg}`);
+             if (isSaleInTargetFY) {
+                 cgtEvents.push([stockCode, stockName, tradeDate, units, disposalProceeds, "ERROR: "+errorMsg, null, "N/A", "N/A", "ERROR: "+errorMsg, 0, "ERROR: "+errorMsg]);
+             }
+        } else if (isSaleInTargetFY && !errorMsg) { // Successfully sourced AND sale in target FY AND no prior error
+            if (ltUnitsSold > 0.0001) {
+                let ltGrossGainLoss = ltProceeds - ltCostBase;
+                let ltDiscount = (ltGrossGainLoss > 0) ? ltGrossGainLoss * 0.5 : 0;
+                let ltNetGainLoss = ltGrossGainLoss - ltDiscount;
+                let ltHoldingPeriod = ltEarliestAcqDate ? Math.floor((tradeDate.getTime() - ltEarliestAcqDate.getTime()) / (1000 * 60 * 60 * 24)) + 1 : "N/A";
+                cgtEvents.push([stockCode, stockName + " (LT)", tradeDate, ltUnitsSold, ltProceeds, ltCostBase, ltEarliestAcqDate, ltHoldingPeriod, "Yes", ltGrossGainLoss, ltDiscount, ltNetGainLoss]);
             }
-            if (stUnitsSold > 0.0001) { /* push ST event */
-                let stGrossGainLoss = stProceeds - stCostBase; let stDiscount = 0; let stNetGainLoss = stGrossGainLoss;
-                let stHoldingPeriod = stEarliestAcqDate ? Math.floor((tradeDate.getTime() - stEarliestAcqDate.getTime()) / (1000 * 60 * 60 * 24)) : "N/A";
-                cgtEvents.push([ stockCode, stockName + " (ST)", tradeDate, stUnitsSold, stProceeds, stCostBase, stEarliestAcqDate, stHoldingPeriod, "No", stGrossGainLoss, stDiscount, stNetGainLoss ]);
+            if (stUnitsSold > 0.0001) {
+                let stGrossGainLoss = stProceeds - stCostBase;
+                let stDiscount = 0;
+                let stNetGainLoss = stGrossGainLoss;
+                let stHoldingPeriod = stEarliestAcqDate ? Math.floor((tradeDate.getTime() - stEarliestAcqDate.getTime()) / (1000 * 60 * 60 * 24)) + 1 : "N/A";
+                cgtEvents.push([stockCode, stockName + " (ST)", tradeDate, stUnitsSold, stProceeds, stCostBase, stEarliestAcqDate, stHoldingPeriod, "No", stGrossGainLoss, stDiscount, stNetGainLoss]);
             }
         }
+        buyInventory[stockCode] = buyInventory[stockCode].filter(p => p.unitsAvailable > 0.0001);
     } // End if action is "sell" or "out"
   } // End loop through all trades
 
-  Logger.log(`\n==== FIFO Processing Complete. ${cgtEvents.length} CGT event rows generated for output. ====`);
-
-  // --- 7. Write Results to CGT Sheet ---
-  const lastRow = cgtSheet.getLastRow();
-  const numOutputCols = 12;
-  if (lastRow >= CGT_OUTPUT_START_ROW) {
-     const numRowsToClear = lastRow - CGT_OUTPUT_START_ROW + 1;
-     if (numRowsToClear > 0) cgtSheet.getRange(CGT_OUTPUT_START_ROW, CGT_OUTPUT_START_COL, numRowsToClear, numOutputCols).clearContent();
+  Logger.log(`FIFO Processing Complete. Processed ${sortedTradesValues.length} trade rows. Skipped ${skippedRowCount} rows due to invalid data (see logs). Generated ${cgtEvents.length} CGT event rows for output.`);
+  if (skippedRowCount > 0) {
+      Logger.log(`WARNING: ${skippedRowCount} trade rows were skipped during CGT calculation due to missing or invalid data (e.g., Trade Date). Check previous log messages for details.`);
   }
-  if (cgtEvents.length > 0) {
-    cgtSheet.getRange(CGT_OUTPUT_START_ROW, CGT_OUTPUT_START_COL, cgtEvents.length, cgtEvents[0].length).setValues(cgtEvents);
-    // Optional formatting for CGT sheet can be added here
-    Logger.log(`Successfully wrote ${cgtEvents.length} CGT event rows to sheet.`);
-    ui.alert(`CGT Calculation Complete. ${cgtEvents.length} CGT rows written for FY ${fyStr}. Check logs for details & errors.`);
-  } else {
-    Logger.log(`No 'Sell' events generated for the selected FY (${fyStr}).`);
-    cgtSheet.getRange(CGT_OUTPUT_START_ROW, CGT_OUTPUT_START_COL, 1, numOutputCols).clearContent();
-    cgtSheet.getRange(CGT_OUTPUT_START_ROW, CGT_OUTPUT_START_COL).setValue(`No 'Sell' events found in Selected FY (${fyStr})`);
-    ui.alert(`CGT Calculation Complete. No 'Sell' events found in FY (${fyStr}).`);
-  }
-   Logger.log(`==== END CGT Calculation ====`);
+  return cgtEvents;
 }
-
 
 /**
  * ===================================================
  *       Portfolio Summary Function (Write-off on 'Out')
  * ===================================================
+ * (This function remains unchanged)
  */
 function updatePortfolioSummary() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -273,138 +353,165 @@ function updatePortfolioSummary() {
       if (tickersStr && typeof tickersStr === 'string') {
           writtenOffTickers = tickersStr.split(',').map(ticker => ticker.trim().toUpperCase()).filter(ticker => ticker !== "");
           if (writtenOffTickers.length > 0) {
-             Logger.log(`Write-off list from ${DELISTED_TICKERS_RANGE}: ${writtenOffTickers.join(', ')}`);
+             Logger.log(`Portfolio Summary: Write-off list from ${DELISTED_TICKERS_RANGE}: ${writtenOffTickers.join(', ')}`);
           }
       }
   } catch (e) {
-      Logger.log(`Could not read written-off tickers from ${PORTFOLIO_SUMMARY_SHEET_NAME}!${DELISTED_TICKERS_RANGE}: ${e}`);
+      Logger.log(`Portfolio Summary: Could not read written-off tickers from ${PORTFOLIO_SUMMARY_SHEET_NAME}!${DELISTED_TICKERS_RANGE}: ${e}`);
   }
 
   // --- 2. Read and Sort Trade Data ---
   const tradesDataRange = tradesSheet.getDataRange();
   let tradesValues = tradesDataRange.getValues().slice(1);
-  tradesValues = tradesValues.filter(row =>
-      row[COL_IDX_PS_SETTLEMENT_DATE] !== "" && String(row[COL_IDX_PS_ACTION]).trim() !== "" &&
-      String(row[COL_IDX_PS_CODE]).trim() !== "" && row[COL_IDX_PS_UNITS] !== ""
-  );
-   if (tradesValues.length === 0) { ui.alert(`Error: No valid trade data found after initial filtering.`); return; }
-   tradesValues.sort((a, b) => { // Sort by Date, then Action Priority
-    const dateA = a[COL_IDX_PS_SETTLEMENT_DATE]; const dateB = b[COL_IDX_PS_SETTLEMENT_DATE];
-    const actionA = String(a[COL_IDX_PS_ACTION]).trim().toLowerCase(); const actionB = String(b[COL_IDX_PS_ACTION]).trim().toLowerCase();
-    let dateComparison = 0;
-    if (dateA instanceof Date && dateB instanceof Date) { dateComparison = dateA.getTime() - dateB.getTime(); }
-    else if (!(dateA instanceof Date)) { return 1; } else { return -1; }
+  let originalRowCount = tradesValues.length;
+  tradesValues = tradesValues.filter(row => {
+      const settlementDate = row[COL_IDX_PS_SETTLEMENT_DATE];
+      const action = String(row[COL_IDX_PS_ACTION]).trim();
+      const code = String(row[COL_IDX_PS_CODE]).trim();
+      const units = row[COL_IDX_PS_UNITS];
+      const unitsNum = parseFloat(String(units).replace(/,/g, ''));
+      return settlementDate instanceof Date && action !== "" && code !== "" && !isNaN(unitsNum) && unitsNum > 0;
+  });
+  let filteredRowCount = tradesValues.length;
+  if (originalRowCount > filteredRowCount) {
+      Logger.log(`Portfolio Summary: Filtered out ${originalRowCount - filteredRowCount} rows due to missing/invalid Settlement Date, Action, Code, or Units.`);
+  }
+
+   if (tradesValues.length === 0) { ui.alert(`Error: No valid trade data found after initial filtering (Portfolio Summary). Check Settlement Dates, Actions, Codes, Units.`); return; }
+
+   tradesValues.sort((a, b) => {
+    const dateA = a[COL_IDX_PS_SETTLEMENT_DATE];
+    const dateB = b[COL_IDX_PS_SETTLEMENT_DATE];
+    const actionA = String(a[COL_IDX_PS_ACTION]).trim().toLowerCase();
+    const actionB = String(b[COL_IDX_PS_ACTION]).trim().toLowerCase();
+    const dateComparison = dateA.getTime() - dateB.getTime();
     if (dateComparison === 0) {
-      const priorityA = (actionA === 'buy' || actionA === 'in') ? 1 : 2; const priorityB = (actionB === 'buy' || actionB === 'in') ? 1 : 2;
-      return (priorityA !== priorityB) ? priorityA - priorityB : 0;
+      const priorityA = (actionA === 'buy' || actionA === 'in') ? 1 : 2;
+      const priorityB = (actionB === 'buy' || actionB === 'in') ? 1 : 2;
+      return priorityA - priorityB;
     } else { return dateComparison; }
   });
-  Logger.log(`Portfolio Summary: Read and sorted ${tradesValues.length} trade rows by Settlement Date, then Action Priority.`);
+  Logger.log(`Portfolio Summary: Read and sorted ${tradesValues.length} valid trade rows by Settlement Date (Buy/In prioritized on same day).`);
 
   // --- 3. FIFO Processing & Data Aggregation ---
   const buyInventory = {};
   const portfolioSummary = {};
+  let skippedProcessingCount = 0;
 
   for (const [i, trade] of tradesValues.entries()) {
-      const sheetRowNumber = i + 2;
-      // Logger.log(`Processing Trade Sheet Row ${sheetRowNumber}: ...`); // Keep logging minimal unless debugging
-
+      const originalSheetRowNumber = i + 2;
       const settlementDate = trade[COL_IDX_PS_SETTLEMENT_DATE];
       const action = String(trade[COL_IDX_PS_ACTION]).trim().toLowerCase();
-      const stockCode = String(trade[COL_IDX_PS_CODE]).trim().toUpperCase(); // Standardize to UpperCase
+      const stockCode = String(trade[COL_IDX_PS_CODE]).trim().toUpperCase();
       const stockName = trade[COL_IDX_PS_NAME];
       const unitsRaw = trade[COL_IDX_PS_UNITS];
+      const units = parseFloat(String(unitsRaw).replace(/,/g, ''));
       const totalRaw = trade[COL_IDX_PS_TOTAL];
 
-      // Parse Units/Total
-      const units = parseFloat(String(unitsRaw).replace(/,/g, ''));
       let total = NaN;
       if (typeof totalRaw === 'number') { total = totalRaw; }
       else if (typeof totalRaw === 'string' && totalRaw.trim() !== '') { total = parseFloat(totalRaw.replace(/[$,]/g, '')); }
-      // Logger.log(` -> Parsed: Action=${action}, Code=${stockCode}, Units=${units}, Total=${total}`);
 
-      // Validation
-      if (!(settlementDate instanceof Date)) { Logger.log(` -> Skip Row ${sheetRowNumber} (Basic - Date)`); continue; }
-      if (!action || !stockCode) { Logger.log(` -> Skip Row ${sheetRowNumber} (Basic - Action/Code)`); continue; }
-      if (isNaN(units) || units <= 0) { Logger.log(` -> Skip Row ${sheetRowNumber} (Units)`); continue; }
-      if ((action === 'buy' || action === 'sell') && isNaN(total)) { Logger.log(` -> Skip Row ${sheetRowNumber} (Total NaN for Buy/Sell)`); continue; }
+      if ((action === 'buy' || action === 'sell') && isNaN(total)) {
+          Logger.log(`PS Skip Row ~${originalSheetRowNumber} (Date: ${settlementDate.toLocaleDateString()}, Code: ${stockCode}, Action: ${action}): Invalid or Missing Total required for ${action}. Value: "${totalRaw}"`);
+          skippedProcessingCount++; continue;
+      }
 
-      // Initialize
-      if (!portfolioSummary[stockCode]) { portfolioSummary[stockCode] = { realizedGL: 0, totalBuyCost: 0, totalSellProceeds: 0, totalUnitsBought: 0, lastSeenName: "N/A" }; }
+      if (!portfolioSummary[stockCode]) {
+           portfolioSummary[stockCode] = { realizedGL: 0, totalBuyCost: 0, totalSellProceeds: 0, totalUnitsBought: 0, lastSeenName: "N/A" };
+      }
       if (stockName && String(stockName).trim() !== "") portfolioSummary[stockCode].lastSeenName = stockName;
       if (!buyInventory[stockCode]) buyInventory[stockCode] = [];
 
-      // --- Process Actions ---
       if (action === "buy") {
         const costPerUnit = (units !== 0) ? total / units : 0;
         buyInventory[stockCode].push({ date: settlementDate, unitsAvailable: units, costPerUnit: costPerUnit });
         portfolioSummary[stockCode].totalBuyCost += total;
         portfolioSummary[stockCode].totalUnitsBought += units;
-        // Logger.log(` -> Added Inventory (Buy): ${stockCode} ${units} @ ${costPerUnit.toFixed(4)}`);
       } else if (action === "in") {
           const costForIn = (!isNaN(total) && total !== 0) ? total : 0;
           const costPerUnit = (units !== 0) ? costForIn / units : 0;
           buyInventory[stockCode].push({ date: settlementDate, unitsAvailable: units, costPerUnit: costPerUnit });
-          // Logger.log(` -> Added Inventory (In): ${stockCode} ${units} @ ${costPerUnit.toFixed(4)} (Cost=${costForIn.toFixed(2)})`);
-          if (costForIn > 0) { portfolioSummary[stockCode].totalBuyCost += costForIn; portfolioSummary[stockCode].totalUnitsBought += units; }
+          if (costForIn > 0) {
+              portfolioSummary[stockCode].totalBuyCost += costForIn;
+              portfolioSummary[stockCode].totalUnitsBought += units;
+          }
       } else if (action === "sell") {
           portfolioSummary[stockCode].totalSellProceeds += total;
-          let unitsToAccountFor = units; let costOfThisSale = 0; let errorInSale = false;
+          let unitsToAccountFor = units;
+          let costOfThisSale = 0;
           const currentAvailable = buyInventory[stockCode].reduce((sum, p) => sum + p.unitsAvailable, 0);
-          if (currentAvailable < unitsToAccountFor - 0.0001) { errorInSale = true; Logger.log(`WARN: Sell ${stockCode} Row ${sheetRowNumber}, insufficient units.`); }
-          else { /* FIFO Loop for Sell */
-              // Logger.log(` -> Processing Sell for ${units.toFixed(4)} ${stockCode}...`);
-              for (const buyParcel of buyInventory[stockCode]) {
-                if (buyParcel.unitsAvailable <= 0.0001) continue;
-                const unitsFromThisParcel = Math.min(unitsToAccountFor, buyParcel.unitsAvailable);
-                if (unitsFromThisParcel > 0) {
-                  const costFromThisParcel = unitsFromThisParcel * buyParcel.costPerUnit;
-                  // Logger.log(`    -> Using ${unitsFromThisParcel.toFixed(4)} from ${buyParcel.date.toLocaleDateString()} @ ${buyParcel.costPerUnit.toFixed(4)}. Cost=${costFromThisParcel.toFixed(2)}`);
-                  costOfThisSale += costFromThisParcel;
-                  buyParcel.unitsAvailable -= unitsFromThisParcel; unitsToAccountFor -= unitsFromThisParcel;
-                } if (unitsToAccountFor <= 0.0001) { unitsToAccountFor = 0; break; }
-              }
-              if (unitsToAccountFor == 0) {
-                  const gainLossThisSale = total - costOfThisSale;
-                  Logger.log(`  -> Sale GL Calc ${stockCode} Row ${sheetRowNumber}: P=${total.toFixed(2)}, C=${costOfThisSale.toFixed(2)}, G/L=${gainLossThisSale.toFixed(2)}`);
-                  portfolioSummary[stockCode].realizedGL += gainLossThisSale;
-              } else if (!errorInSale) { Logger.log(`ERROR: Sell ${stockCode} Row ${sheetRowNumber}, FIFO loop finished short.`); }
+          if (currentAvailable < unitsToAccountFor - 0.0001) {
+              Logger.log(`WARN: Sell ${stockCode} Row ~${originalSheetRowNumber} on ${settlementDate.toLocaleDateString()}, insufficient units. Need ${unitsToAccountFor.toFixed(4)}, Have ${currentAvailable.toFixed(4)}.`);
           }
-      } else if (action === "out") { // **** MODIFIED 'OUT' LOGIC ****
+          let unitsSuccessfullySourced = 0;
+          for (const buyParcel of buyInventory[stockCode]) {
+            if (buyParcel.unitsAvailable <= 0.0001) continue;
+            const unitsFromThisParcel = Math.min(unitsToAccountFor - unitsSuccessfullySourced, buyParcel.unitsAvailable);
+            if (unitsFromThisParcel > 0) {
+              const costFromThisParcel = unitsFromThisParcel * buyParcel.costPerUnit;
+              costOfThisSale += costFromThisParcel;
+              unitsSuccessfullySourced += unitsFromThisParcel;
+              buyParcel.unitsAvailable -= unitsFromThisParcel;
+            }
+            if (unitsSuccessfullySourced >= unitsToAccountFor - 0.0001) break;
+          }
+          if (unitsSuccessfullySourced > 0.0001) {
+              const gainLossThisSale = total - costOfThisSale;
+              Logger.log(`  -> PS Sell GL Calc ${stockCode} Row ~${originalSheetRowNumber}: Units=${unitsSuccessfullySourced.toFixed(4)}, Proceeds=${total.toFixed(2)}, Sourced Cost=${costOfThisSale.toFixed(2)}, G/L=${gainLossThisSale.toFixed(2)}`);
+              portfolioSummary[stockCode].realizedGL += gainLossThisSale;
+          } else {
+               Logger.log(`  -> PS Sell GL Calc ${stockCode} Row ~${originalSheetRowNumber}: Could not source cost basis. Proceeds=${total.toFixed(2)}, Cost=0, G/L=${total.toFixed(2)}.`);
+               portfolioSummary[stockCode].realizedGL += total;
+          }
+          if (Math.abs(unitsSuccessfullySourced - unitsToAccountFor) > 0.0001) {
+              Logger.log(`   -> WARN: Sell ${stockCode} Row ~${originalSheetRowNumber}: Discrepancy units sold (${unitsToAccountFor.toFixed(4)}) vs sourced (${unitsSuccessfullySourced.toFixed(4)}).`);
+          }
+
+      } else if (action === "out") {
           let unitsToAccountFor = units;
           let costOfThisOut = 0;
-          let errorInSale = false;
-          const isWriteOff = writtenOffTickers.includes(stockCode); // Check write-off list
-
+          const isWriteOff = writtenOffTickers.includes(stockCode);
           const currentAvailable = buyInventory[stockCode].reduce((sum, p) => sum + p.unitsAvailable, 0);
            if (currentAvailable < unitsToAccountFor - 0.0001) {
-              errorInSale = true; Logger.log(`WARN: Out ${stockCode} Row ${sheetRowNumber}, insufficient units. Have=${currentAvailable.toFixed(4)}, Need=${unitsToAccountFor.toFixed(4)}.`);
+              Logger.log(`WARN: Out ${stockCode} Row ~${originalSheetRowNumber} on ${settlementDate.toLocaleDateString()}, insufficient units. Need=${unitsToAccountFor.toFixed(4)}, Have=${currentAvailable.toFixed(4)}.`);
+           }
+           let unitsSuccessfullySourced = 0;
+           for (const buyParcel of buyInventory[stockCode]) {
+             if (buyParcel.unitsAvailable <= 0.0001) continue;
+             const unitsFromThisParcel = Math.min(unitsToAccountFor - unitsSuccessfullySourced, buyParcel.unitsAvailable);
+             if (unitsFromThisParcel > 0) {
+               const costFromThisParcel = unitsFromThisParcel * buyParcel.costPerUnit;
+               costOfThisOut += costFromThisParcel;
+               unitsSuccessfullySourced += unitsFromThisParcel;
+               buyParcel.unitsAvailable -= unitsFromThisParcel;
+             }
+             if (unitsSuccessfullySourced >= unitsToAccountFor - 0.0001) break;
+           }
+           if (unitsSuccessfullySourced > 0.0001) {
+               if (isWriteOff) {
+                   const lossRealized = 0 - costOfThisOut;
+                   Logger.log(`  -> PS WRITE-OFF via 'Out' ${stockCode} Row ~${originalSheetRowNumber}: Units=${unitsSuccessfullySourced.toFixed(4)}, Sourced Cost=${costOfThisOut.toFixed(2)}, Realized Loss=${lossRealized.toFixed(2)}`);
+                   portfolioSummary[stockCode].realizedGL += lossRealized;
+               } else {
+                   Logger.log(`  -> PS Normal 'Out' ${stockCode} Row ~${originalSheetRowNumber}: Removed ${unitsSuccessfullySourced.toFixed(4)} units cost ${costOfThisOut.toFixed(2)}.`);
+               }
            } else {
-              Logger.log(` -> Processing Out for ${units.toFixed(4)} ${stockCode}. Available=${currentAvailable.toFixed(4)}. Is WriteOff: ${isWriteOff}`);
-              for (const buyParcel of buyInventory[stockCode]) { /* FIFO Loop */
-                if (buyParcel.unitsAvailable <= 0.0001) continue;
-                const unitsFromThisParcel = Math.min(unitsToAccountFor, buyParcel.unitsAvailable);
-                 if (unitsFromThisParcel > 0) {
-                  const costFromThisParcel = unitsFromThisParcel * buyParcel.costPerUnit;
-                  // Logger.log(`    -> Removing ${unitsFromThisParcel.toFixed(4)} from ${buyParcel.date.toLocaleDateString()} @ ${buyParcel.costPerUnit.toFixed(4)}. Cost=${costFromThisParcel.toFixed(2)}`);
-                  costOfThisOut += costFromThisParcel; // Always calculate cost of units removed
-                  buyParcel.unitsAvailable -= unitsFromThisParcel; unitsToAccountFor -= unitsFromThisParcel;
-                } if (unitsToAccountFor <= 0.0001) { unitsToAccountFor = 0; break; }
-              } // End FIFO loop
+               Logger.log(`  -> PS Out ${stockCode} Row ~${originalSheetRowNumber}: Could not source units to remove.`);
+           }
+            if (Math.abs(unitsSuccessfullySourced - unitsToAccountFor) > 0.0001) {
+              Logger.log(`   -> WARN: Out ${stockCode} Row ~${originalSheetRowNumber}: Discrepancy units out (${unitsToAccountFor.toFixed(4)}) vs sourced (${unitsSuccessfullySourced.toFixed(4)}).`);
+            }
+      } // End actions
 
-              if (unitsToAccountFor == 0) {
-                  if (isWriteOff) { // If it was a write-off, realize the loss now
-                      const lossRealized = 0 - costOfThisOut;
-                      Logger.log(`  -> WRITE-OFF via 'Out' ${stockCode} Row ${sheetRowNumber}: Cost=${costOfThisOut.toFixed(2)}, Realized Loss=${lossRealized.toFixed(2)}`);
-                      portfolioSummary[stockCode].realizedGL += lossRealized;
-                  } else {
-                      // Logger.log(` -> Normal 'Out' completed for ${stockCode} Row ${sheetRowNumber}. Inventory reduced.`);
-                  }
-              } else if (!errorInSale) { Logger.log(`ERROR: Out ${stockCode} Row ${sheetRowNumber}, FIFO loop finished short.`); }
-           } // End else (sufficient units)
-      } // End if action is 'out'
-    } // End loop through sorted trades
+      if (buyInventory[stockCode]) {
+          buyInventory[stockCode] = buyInventory[stockCode].filter(p => p.unitsAvailable > 0.0001);
+      }
+    } // End loop trades
 
+    if (skippedProcessingCount > 0) {
+         Logger.log(`Portfolio Summary: Skipped processing ${skippedProcessingCount} rows during calculation due to missing Total for Buy/Sell actions.`);
+    }
 
     // --- 4. Prepare Output Array ---
     const outputData = [];
@@ -416,14 +523,13 @@ function updatePortfolioSummary() {
          });
        }
        const avgBuyPriceForStock = (portfolioSummary[stockCode].totalUnitsBought > 0.0001) ? (portfolioSummary[stockCode].totalBuyCost / portfolioSummary[stockCode].totalUnitsBought) : 0;
-       // Always include processed stocks
        outputData.push({
           code: stockCode, name: portfolioSummary[stockCode].lastSeenName, unitsHeld: currentUnitsHeld, totalBuyCostAllTime: portfolioSummary[stockCode].totalBuyCost,
           totalSellProceedsAllTime: portfolioSummary[stockCode].totalSellProceeds, avgBuyPrice: avgBuyPriceForStock, costBaseHoldings: costBaseOfHoldings, realizedGL: portfolioSummary[stockCode].realizedGL
        });
     }
     outputData.sort((a, b) => a.code.localeCompare(b.code));
-    Logger.log(`Summary Sheet: Sorted output data for ${outputData.length} stocks alphabetically.`);
+    Logger.log(`Portfolio Summary: Calculated holdings and sorted output data for ${outputData.length} stocks.`);
 
     // --- 6. Create Final Output with Formulas ---
     const finalOutputArrayWithFormulas = outputData.map((item, index) => {
@@ -437,22 +543,26 @@ function updatePortfolioSummary() {
 
     // --- 7. Write Results to Summary Sheet ---
      const detailLastRow = summarySheet.getLastRow();
+     const numOutputCols = 12;
      if (detailLastRow >= PS_DETAIL_START_ROW) {
          const numRowsToClear = detailLastRow - PS_DETAIL_START_ROW + 1;
-         if (numRowsToClear > 0) summarySheet.getRange(PS_DETAIL_START_ROW, PS_DETAIL_START_COL, numRowsToClear, 12).clearContent();
+         if (numRowsToClear > 0) {
+             summarySheet.getRange(PS_DETAIL_START_ROW, PS_DETAIL_START_COL, numRowsToClear, numOutputCols).clearContent().clearFormat();
+             Logger.log(`Portfolio Summary: Cleared previous detail data & format from row ${PS_DETAIL_START_ROW}.`);
+         }
      }
      if (finalOutputArrayWithFormulas.length > 0) {
         summarySheet.getRange(PS_DETAIL_START_ROW, PS_DETAIL_START_COL, finalOutputArrayWithFormulas.length, finalOutputArrayWithFormulas[0].length).setValues(finalOutputArrayWithFormulas);
-        Logger.log(`Summary Sheet: Successfully wrote ${finalOutputArrayWithFormulas.length} stock summaries.`);
-        try { // Apply Formatting
-           const detailRange = summarySheet.getRange(PS_DETAIL_START_ROW, PS_DETAIL_START_COL, finalOutputArrayWithFormulas.length, finalOutputArrayWithFormulas[0].length);
+        Logger.log(`Portfolio Summary: Successfully wrote ${finalOutputArrayWithFormulas.length} stock summaries.`);
+        try {
+           const detailRange = summarySheet.getRange(PS_DETAIL_START_ROW, PS_DETAIL_START_COL, finalOutputArrayWithFormulas.length, numOutputCols);
            const psFormats = [ null, null, '#,##0.00##', '$#,##0.00', '$#,##0.00', '$#,##0.0000', '$#,##0.00', '$#,##0.00', '$#,##0.00', '$#,##0.00', '$#,##0.00', '$#,##0.00' ];
            const psFormatArray = finalOutputArrayWithFormulas.map(() => psFormats);
-           if (psFormatArray.length > 0) { detailRange.setNumberFormats(psFormatArray); Logger.log(`Summary Sheet: Applied number formats.`); }
-        } catch (e) { Logger.log(`Summary Sheet: FAILED applying number formats. Error: ${e} \nStack: ${e.stack}`); }
+           if (psFormatArray.length > 0) { detailRange.setNumberFormats(psFormatArray); Logger.log(`Portfolio Summary: Applied number formats.`); }
+        } catch (e) { Logger.log(`Portfolio Summary: FAILED applying number formats. Error: ${e} \nStack: ${e.stack}`); }
      } else {
-        summarySheet.getRange(PS_DETAIL_START_ROW, PS_DETAIL_START_COL, 1, 12).clearContent();
-        summarySheet.getRange(PS_DETAIL_START_ROW, PS_DETAIL_START_COL).setValue("No trade data resulted in portfolio holdings/activity.");
+        summarySheet.getRange(PS_DETAIL_START_ROW, PS_DETAIL_START_COL, 1, numOutputCols).clearContent().clearFormat();
+        summarySheet.getRange(PS_DETAIL_START_ROW, PS_DETAIL_START_COL).setValue("No valid trade data resulted in portfolio holdings/activity.");
      }
 
     // --- 8. Update Summary Section Using FORMULAS ---
@@ -465,7 +575,8 @@ function updatePortfolioSummary() {
     summarySheet.getRange(PS_SUMMARY_ROWS.totalGainLoss, PS_SUMMARY_VALUE_COL).setFormula(`=IFERROR(SUM(${detailRangeStr("L")}),0)`).setNumberFormat('$#,##0.00');
     const numHoldings = outputData.filter(item => item.unitsHeld > 0.0001).length;
     summarySheet.getRange(PS_SUMMARY_ROWS.numHoldings, PS_SUMMARY_VALUE_COL).setValue(numHoldings).setNumberFormat('#,##0');
-
+    Logger.log(`Portfolio Summary: Updated top summary section with formulas.`);
     Logger.log(`==== END Portfolio Summary Update ====`);
+    ui.alert(`Portfolio Summary Updated Successfully.`);
 
 } // End updatePortfolioSummary function
