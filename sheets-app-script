@@ -155,14 +155,16 @@ function calculateCGT() {
   Logger.log(`\n--- Writing Results to Sheet ${CGT_SHEET_NAME} ---`);
   const lastRow = cgtSheet.getMaxRows(); // Use getMaxRows for clearing potential old data further down
 
-  // Clear existing data for Current FY (Columns A-L)
+  // Clear existing data from previous runs
   const clearStartRow = CGT_OUTPUT_START_ROW;
   if (lastRow >= clearStartRow) {
      const numRowsToClear = lastRow - clearStartRow + 1;
-     // Also clear columns N-Y in case old data exists there from previous script version
-     const numColsToClearIncludingOldPrev = (CGT_PREV_FY_OUTPUT_START_COL || CGT_OUTPUT_START_COL + CGT_NUM_OUTPUT_COLS + 1) - CGT_OUTPUT_START_COL + CGT_NUM_OUTPUT_COLS; // Calculate width to clear potential old data
-     cgtSheet.getRange(clearStartRow, CGT_OUTPUT_START_COL, numRowsToClear, Math.max(CGT_NUM_OUTPUT_COLS, numColsToClearIncludingOldPrev)).clearContent().clearFormat(); // Clear content and format widely
-     Logger.log(`Cleared previous data & format from row ${clearStartRow} Col ${CGT_OUTPUT_START_COL} onwards.`);
+     // Clear a wide range (e.g., A-Z) to remove current data (A-L) and any potential old data (e.g., in N-Y)
+     const NUM_COLS_TO_CLEAR_WIDE = 26; // Clear A-Z
+     cgtSheet.getRange(clearStartRow, CGT_OUTPUT_START_COL, numRowsToClear, NUM_COLS_TO_CLEAR_WIDE)
+             .clearContent()
+             .clearFormat();
+     Logger.log(`Cleared previous data & format from row ${clearStartRow} for ${NUM_COLS_TO_CLEAR_WIDE} columns.`);
   }
 
   // Write Current FY results
